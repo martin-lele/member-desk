@@ -1,0 +1,13 @@
+data/
+backups/
+.env
+.env.*
+!.env.example
+*.sqlite*
+*.db
+*.log
+*.pem
+*.key
+__pycache__/
+*.pyc
+.DS_Store
