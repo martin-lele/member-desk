@@ -17,6 +17,7 @@ UTC=dt.timezone.utc
 CST=dt.timezone(dt.timedelta(hours=8))
 SCHEMA='''
 CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,username TEXT NOT NULL UNIQUE,name TEXT NOT NULL,password TEXT NOT NULL,role TEXT NOT NULL,status TEXT NOT NULL,store_id TEXT,employee_id TEXT,created TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS user_application_rejections(user_id TEXT PRIMARY KEY REFERENCES users(id),reason TEXT NOT NULL,reviewer_id TEXT NOT NULL,reviewer_name TEXT NOT NULL,created TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS stores(id TEXT PRIMARY KEY,name TEXT NOT NULL UNIQUE,active INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE IF NOT EXISTS employees(id TEXT PRIMARY KEY,name TEXT NOT NULL,store_id TEXT NOT NULL REFERENCES stores(id),active INTEGER NOT NULL DEFAULT 1,UNIQUE(name,store_id));
 CREATE TABLE IF NOT EXISTS members(id TEXT PRIMARY KEY,name TEXT NOT NULL,phone TEXT NOT NULL UNIQUE,birthday TEXT NOT NULL,identity TEXT NOT NULL,deleted_at TEXT NOT NULL DEFAULT '',created TEXT NOT NULL);
@@ -90,8 +91,39 @@ def verify_password(p,stored):
  except (ValueError,AttributeError):return False
 def audit(c,user,action,detail=''):
  c.execute('INSERT INTO audit VALUES(?,?,?,?,?)',(uid(),user['id'],action,detail,now()))
+def manager(user):
+ if user['role'] not in ('admin','manager'):raise Problem('此操作仅限管理员或店长',403)
+def manage_store(user,sid):
+ manager(user)
+ if user['role']!='admin' and (not sid or sid!=user['store_id']):raise Problem('只能管理本门店',403)
+def visible_users(c,u):
+ manager(u)
+ clause='' if u['role']=='admin' else ' WHERE u.store_id=? AND u.role IN ("staff","manager")'
+ args=() if u['role']=='admin' else (u['store_id'],)
+ return rows(c,'SELECT u.id,u.username,u.name,u.role,u.status,u.store_id,u.employee_id,u.created,r.reason AS rejection_reason,r.reviewer_name AS rejected_by,r.created AS rejected_at FROM users u LEFT JOIN user_application_rejections r ON r.user_id=u.id'+clause+' ORDER BY u.created DESC',args)
 def admin(user):
  if user['role']!='admin':raise Problem('此操作仅限管理员',403)
+def recharge_leaderboard(c,at=None):
+ # Share only aggregate employee performance across stores, never member records.
+ at=at or dt.datetime.now(CST)
+ first=at.astimezone(CST).replace(day=1,hour=0,minute=0,second=0,microsecond=0)
+ next_month=(first.replace(day=28)+dt.timedelta(days=4)).replace(day=1)
+ bounds=[d.astimezone(UTC).isoformat(timespec='milliseconds').replace('+00:00','Z') for d in (first,next_month)]
+ entries=rows(c,"""SELECT l.employee_id,e.name AS employee,l.store_name,SUM(l.amount) AS amount
+ FROM ledger l JOIN members m ON m.id=l.member_id JOIN employees e ON e.id=l.employee_id
+ WHERE m.practice=0 AND l.attribution='staff' AND l.entry_type IN ('recharge','recharge_refund')
+ AND l.created>=? AND l.created<? GROUP BY l.employee_id,l.store_name""",bounds)
+ totals={}
+ for entry in entries:
+  item=totals.setdefault(entry['employee_id'],{'employee':entry['employee'],'stores':set(),'amount':0})
+  item['amount']+=entry['amount'];item['stores'].add(entry['store_name'] or '历史未归属')
+ ordered=sorted(((key,item) for key,item in totals.items() if item['amount']>0),key=lambda pair:(-pair[1]['amount'],pair[1]['employee'],pair[0]))[:3]
+ leaders=[];rank=0;previous=None
+ for index,(_,item) in enumerate(ordered):
+  if item['amount']!=previous:rank=index+1
+  previous=item['amount']
+  leaders.append({'rank':rank,'employee':item['employee'],'store':' / '.join(sorted(item['stores'])),'amount':item['amount']})
+ return {'period':first.strftime('%Y-%m'),'leaders':leaders,'updated':now()}
 def valid_date(s):
  try:return dt.date(1900,1,1)<=dt.date.fromisoformat(s)<=dt.datetime.now(CST).date()
  except ValueError:return False
@@ -159,8 +191,8 @@ def perform(c,u,b):
   key=text(b.get('key',''),80)
   if not re.fullmatch(r'[a-zA-Z0-9-]{16,80}',key):raise Problem('交易请求编号无效')
   kind=b.get('kind');amount=cents(b.get('amount'))
-  if kind not in ('recharge','spend'):raise Problem('交易类型无效')
-  if kind=='spend':amount=-amount
+  if kind=='spend':raise Problem('会员台已关闭手动扣费，请在百居易办理储值消费',403)
+  if kind!='recharge':raise Problem('交易类型无效')
   note=text(b.get('note','')) or ('会员充值' if amount>0 else '会员消费')
   store_id=text(b.get('store_id',''),80);attr=b.get('attribution') if amount>0 else 'none';eid=b.get('employee_id') if attr=='staff' else None
   if amount>0 and attr not in ('staff','walkin'):raise Problem('请选择业绩归属员工或上门客户')
@@ -230,17 +262,49 @@ def perform(c,u,b):
   if not name:raise Problem('请填写门店名称')
   c.execute('INSERT INTO stores VALUES(?,?,1)',(uid(),name));audit(c,u,action);return {'ok':True}
  if action=='add_employee':
-  admin(u);name=text(b.get('name',''),50);sid=b.get('store_id')
+  name=text(b.get('name',''),50);sid=b.get('store_id');manage_store(u,sid)
   if not name or not c.execute('SELECT 1 FROM stores WHERE id=? AND active=1',(sid,)).fetchone():raise Problem('请填写姓名并选择有效门店')
   c.execute('INSERT INTO employees VALUES(?,?,?,1)',(uid(),name,sid));audit(c,u,action);return {'ok':True}
  if action in ('toggle_store','toggle_employee'):
-  admin(u);table='stores' if action=='toggle_store' else 'employees';active=b.get('active')
+  table='stores' if action=='toggle_store' else 'employees';active=b.get('active')
+  if table=='stores':admin(u)
+  else:
+   employee=c.execute('SELECT * FROM employees WHERE id=?',(mid,)).fetchone()
+   if not employee:raise Problem('员工不存在',404)
+   manage_store(u,employee['store_id'])
+   if u['role']!='admin' and c.execute('SELECT 1 FROM users WHERE employee_id=? AND role IN ("admin","manager")',(mid,)).fetchone():raise Problem('店长不能停用管理人员',403)
   if type(active)!=bool:raise Problem('状态无效')
   c.execute('UPDATE '+table+' SET active=? WHERE id=?',(int(active),mid));audit(c,u,action);return {'ok':True}
+ if action=='reject_user':
+  manager(u)
+  target=c.execute('SELECT * FROM users WHERE id=? AND role="staff"',(mid,)).fetchone()
+  if not target:raise Problem('只能拒绝普通员工的待审批申请',403)
+  manage_store(u,target['store_id'])
+  reason=text(b.get('reason',''),500)
+  if not reason:raise Problem('请填写拒绝原因')
+  if target['status']=='rejected':
+   old=c.execute('SELECT reason FROM user_application_rejections WHERE user_id=?',(mid,)).fetchone()
+   if old and old['reason']==reason:return {'ok':True,'replayed':True}
+   raise Problem('申请已处理，请刷新查看原拒绝记录',409)
+  if target['status']!='pending':raise Problem('只能拒绝待审批申请，该账号状态已变化，请刷新',409)
+  c.execute('INSERT INTO user_application_rejections VALUES(?,?,?,?,?)',(mid,reason,u['id'],u['name'],now()))
+  c.execute('UPDATE users SET status="rejected" WHERE id=?',(mid,))
+  c.execute('DELETE FROM sessions WHERE user_id=?',(mid,))
+  audit(c,u,action,json.dumps({'user_id':mid,'reason':reason},ensure_ascii=False))
+  return {'ok':True}
  if action=='approve_user':
-  admin(u)
+  manager(u)
   if b.get('frontdesk_verified') is not True:raise Problem('请先核实申请人本人、百居易账号及前厅角色，并勾选核验确认')
   target=c.execute('SELECT * FROM users WHERE id=? AND role="staff"',(mid,)).fetchone()
+  if u['role']!='admin':
+   if not target:raise Problem('只能审批普通员工',403)
+   manage_store(u,target['store_id'])
+   manage_store(u,b.get('store_id') or u['store_id'])
+   if b.get('employee_id'):
+    selected=c.execute('SELECT store_id FROM employees WHERE id=?',(b['employee_id'],)).fetchone()
+    if not selected:raise Problem('员工不存在')
+    manage_store(u,selected['store_id'])
+  if target and target['status']=='rejected':raise Problem('该申请已拒绝，不能直接审批，请先联系管理员核对',409)
   if target and b.get('store_id'):
    sid=b['store_id']
    if not c.execute('SELECT 1 FROM stores WHERE id=? AND active=1',(sid,)).fetchone():raise Problem('请选择启用的门店')
@@ -249,11 +313,28 @@ def perform(c,u,b):
   employee=c.execute('SELECT e.* FROM employees e JOIN stores s ON s.id=e.store_id WHERE e.id=? AND e.active=1 AND s.active=1',(b.get('employee_id'),)).fetchone()
   if not target or not employee:raise Problem('请选择申请账号和有效员工')
   if c.execute('SELECT 1 FROM users WHERE employee_id=? AND status="active" AND id!=?',(employee['id'],mid)).fetchone():raise Problem('该员工已绑定其他账号')
-  c.execute('UPDATE users SET status="active",store_id=?,employee_id=?,name=? WHERE id=?',(employee['store_id'],employee['id'],employee['name'],mid));audit(c,u,action,mid);audit(c,u,'frontdesk_identity_verified',json.dumps({'user_id':mid,'username':target['username'],'store_id':employee['store_id'],'method':'administrator_manual_review'},ensure_ascii=False));return {'ok':True}
+  c.execute('UPDATE users SET status="active",store_id=?,employee_id=?,name=? WHERE id=?',(employee['store_id'],employee['id'],employee['name'],mid));audit(c,u,action,mid);audit(c,u,'frontdesk_identity_verified',json.dumps({'user_id':mid,'username':target['username'],'store_id':employee['store_id'],'method':'manager_manual_review' if u['role']=='manager' else 'administrator_manual_review'},ensure_ascii=False));return {'ok':True}
  if action=='disable_user':
-  admin(u)
+  manager(u)
+  target=c.execute('SELECT * FROM users WHERE id=? AND role="staff"',(mid,)).fetchone()
+  if not target:raise Problem('只能停用普通员工',403)
+  manage_store(u,target['store_id'])
   if not c.execute('SELECT 1 FROM users WHERE id=? AND role="staff"',(mid,)).fetchone():raise Problem('此处只能停用员工账号')
   c.execute('UPDATE users SET status="disabled" WHERE id=?',(mid,));c.execute('DELETE FROM sessions WHERE user_id=?',(mid,));audit(c,u,action,mid);return {'ok':True}
+ if action=='set_manager_role':
+  admin(u);role=b.get('role')
+  if role not in ('staff','manager'):raise Problem('角色无效')
+  target=c.execute('SELECT * FROM users WHERE id=? AND role IN ("staff","manager") AND status="active"',(mid,)).fetchone()
+  if not target or not c.execute('SELECT 1 FROM employees e JOIN stores s ON e.store_id=s.id WHERE e.id=? AND e.store_id=? AND e.active=1 AND s.active=1',(target['employee_id'],target['store_id'])).fetchone():raise Problem('请先审批并分配有效员工和门店')
+  c.execute('UPDATE users SET role=? WHERE id=?',(role,mid));audit(c,u,action,json.dumps({'user_id':mid,'role':role,'store_id':target['store_id']}));return {'ok':True}
+ if action=='review_member_order':
+  manager(u);code=text(b.get('code',''),100);note=text(b.get('note',''),500)
+  if not note:raise Problem('请填写核对结果或跟进事项')
+  order=c.execute('SELECT o.status,s.store_id FROM member_autopay_orders o LEFT JOIN member_order_scopes s ON s.code=o.code WHERE o.code=?',(code,)).fetchone()
+  if not order or order['status']!='blocked':raise Problem('订单状态已变化，请刷新')
+  manage_store(u,order['store_id']) if u['role']!='admin' else None
+  stamp=now();c.execute('INSERT INTO member_order_reviews(code,note,reviewer,updated) VALUES(?,?,?,?) ON CONFLICT(code) DO UPDATE SET note=excluded.note,reviewer=excluded.reviewer,updated=excluded.updated',(code,note,u['name'],stamp))
+  audit(c,u,action,json.dumps({'code':code,'note':note},ensure_ascii=False));return {'ok':True}
  if action=='change_password':
   if not verify_password(b.get('old_password',''),u['password']):raise Problem('原密码不正确')
   c.execute('UPDATE users SET password=? WHERE id=?',(password_hash(b.get('new_password')),u['id']));c.execute('DELETE FROM sessions WHERE user_id=?',(u['id'],));return {'ok':True,'logout':True}
@@ -281,7 +362,7 @@ class Handler(BaseHTTPRequestHandler):
   if not token:return None
   digest=hashlib.sha256(token.value.encode()).hexdigest()
   row=c.execute('SELECT u.*,s.csrf,s.token FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.expires>? AND u.status="active"',(digest,int(time.time()))).fetchone()
-  if row and row['role']=='staff':
+  if row and row['role'] in ('staff','manager'):
    if not c.execute('SELECT 1 FROM employees e JOIN stores s ON s.id=e.store_id WHERE e.id=? AND e.active=1 AND s.active=1',(row['employee_id'],)).fetchone():return None
   return row
  def require_user(self,c):
@@ -296,7 +377,7 @@ class Handler(BaseHTTPRequestHandler):
      u=self.get_user(c)
      if path=='/api/bootstrap':
       setup=not bool(c.execute('SELECT 1 FROM users WHERE role="admin"').fetchone())
-      return self.respond({'version':'2026.09.24.2','password_recovery':{'method':'sms','available':False},'application':'local-member-desk','setup':setup,'user':public_user(u) if u else None,'csrf':u['csrf'] if u else None,'storage':'本机 SQLite 数据库','remote_configured':bool(self.server.public_url)})
+      return self.respond({'version':'2026.09.24.2','manager_permissions':True,'account_rejections':True,'recharge_ranking':True,'registration_stores':rows(c,'SELECT id,name FROM stores WHERE active=1 ORDER BY name'),'password_recovery':{'method':'sms','available':False},'application':'local-member-desk','setup':setup,'user':public_user(u) if u else None,'csrf':u['csrf'] if u else None,'storage':'本机 SQLite 数据库','remote_configured':bool(self.server.public_url)})
      u=self.require_user(c)
      if path=='/api/members':
       data=rows(c,"SELECT m.id,m.name,m.phone,m.birthday,m.created,m.deleted_at,m.practice,CASE WHEN m.identity='' THEN '' ELSE substr(m.identity,1,3)||'***********'||substr(m.identity,-4) END AS identity,COALESCE(SUM(l.amount),0) AS balance FROM members m LEFT JOIN ledger l ON l.member_id=m.id GROUP BY m.id ORDER BY m.created DESC")
@@ -308,6 +389,7 @@ class Handler(BaseHTTPRequestHandler):
      if path=='/api/ledger':
       mid=q.get('member',[''])[0]
       return self.respond({'ledger':rows(c,'SELECT l.*,n.status AS notification_status FROM ledger l LEFT JOIN sms_notifications n ON n.ledger_id=l.id WHERE l.member_id=? ORDER BY l.created DESC',(mid,))})
+     if path=='/api/recharge-leaderboard':return self.respond(recharge_leaderboard(c))
      if path=='/api/recharges':
       start=q.get('start',[''])[0];end=q.get('end',[''])[0];where=["l.entry_type IN ('recharge','recharge_refund')",'m.practice=0'];args=[]
       if start and end and start>end:raise Problem('开始日期不能晚于结束日期')
@@ -335,7 +417,7 @@ class Handler(BaseHTTPRequestHandler):
       admin(u);return self.respond({**PMS.status(),'autopay':AUTO.status(u)})
      if path=='/api/member-orders':return self.respond(AUTO.status(u))
      if path=='/api/users':
-      admin(u);return self.respond({'users':rows(c,'SELECT id,username,name,role,status,store_id,employee_id,created FROM users ORDER BY created DESC')})
+      return self.respond({'users':visible_users(c,u)})
      raise Problem('页面不存在',404)
    name={'/':'index.html','/app.js':'app.js','/style.css':'style.css','/favicon.svg':'favicon.svg'}.get(path)
    if not name:raise Problem('页面不存在',404)
@@ -410,14 +492,18 @@ class Handler(BaseHTTPRequestHandler):
    if not name:raise Problem('请填写真实姓名')
    hashed=password_hash(password)
    with transaction() as c:
+    sid=b.get('store_id')
+    if not c.execute('SELECT 1 FROM stores WHERE id=? AND active=1',(sid,)).fetchone():raise Problem('请选择申请加入的门店')
     if not c.execute('SELECT 1 FROM users WHERE role="admin"').fetchone():raise Problem('请先由管理员完成本机设置')
-    c.execute('INSERT INTO users VALUES(?,?,?,?,?,?,?,?,?)',(uid(),username,name,hashed,'staff','pending',None,None,now()))
-   return self.respond({'ok':True,'message':'申请已提交，请联系管理员核实百居易前厅身份并分配门店；通过后使用本次设置的会员台密码登录'})
+    c.execute('INSERT INTO users VALUES(?,?,?,?,?,?,?,?,?)',(uid(),username,name,hashed,'staff','pending',sid,None,now()))
+   return self.respond({'ok':True,'message':'申请已提交，请联系所属门店店长或管理员核实前厅身份；通过后使用本次设置的会员台密码登录'})
   with transaction() as c:
    u=c.execute('SELECT * FROM users WHERE username=?',(username,)).fetchone()
    if not u or not verify_password(password,u['password']):raise Problem('账号或密码不正确',401)
-   if u['status']!='active':raise Problem('注册申请待审批，请联系管理员在“门店与员工”中分配门店' if u['status']=='pending' else '账号已停用，请联系管理员恢复',403)
-   if u['role']=='staff' and not c.execute('SELECT 1 FROM employees e JOIN stores s ON s.id=e.store_id WHERE e.id=? AND e.active=1 AND s.active=1',(u['employee_id'],)).fetchone():raise Problem('所属门店或员工已停用',403)
+   if u['status']!='active':
+    message={'pending':'注册申请待审批，请联系所属门店店长或管理员处理','rejected':'注册申请未通过，请联系所属门店店长或管理员了解原因'}.get(u['status'],'账号已停用，请联系管理员恢复')
+    raise Problem(message,403)
+   if u['role'] in ('staff','manager') and not c.execute('SELECT 1 FROM employees e JOIN stores s ON s.id=e.store_id WHERE e.id=? AND e.active=1 AND s.active=1',(u['employee_id'],)).fetchone():raise Problem('所属门店或员工已停用',403)
    token=secrets.token_urlsafe(32);csrf=secrets.token_urlsafe(24);digest=hashlib.sha256(token.encode()).hexdigest();c.execute('DELETE FROM sessions WHERE expires<?',(stamp,));c.execute('INSERT INTO sessions VALUES(?,?,?,?)',(digest,u['id'],csrf,stamp+28800))
   secure='; Secure' if self.server.public_url else ''
   return self.respond({'ok':True},cookie=f'member_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800'+secure)

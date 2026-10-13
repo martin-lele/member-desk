@@ -70,10 +70,10 @@ class Engine:
  def status(self,user):
   a=self.app;config=self.config()
   with contextlib.closing(a.connect()) as c:
-   where='' if user['role']=='admin' else ' WHERE o.store_id=?'
+   where='' if user['role']=='admin' else ' WHERE scope.store_id=?'
    args=() if user['role']=='admin' else (user['store_id'],)
-   orders=a.rows(c,'SELECT o.code,o.store_id,o.charged,o.target,o.status,o.reason,o.checked,o.updated,m.name AS member_name FROM member_autopay_orders o LEFT JOIN members m ON m.id=o.member_id'+where+' ORDER BY (o.status="blocked") DESC,o.updated DESC LIMIT 100',args)
-   counts=dict(c.execute('SELECT status,COUNT(*) FROM member_autopay_orders o'+where+' GROUP BY status',args).fetchall())
+   orders=a.rows(c,'SELECT o.code,scope.store_id AS store_id,o.charged,o.target,o.status,o.reason,o.checked,o.updated,m.name AS member_name,r.note AS review_note,r.reviewer,r.updated AS reviewed_at FROM member_autopay_orders o LEFT JOIN members m ON m.id=o.member_id LEFT JOIN member_order_scopes scope ON scope.code=o.code LEFT JOIN member_order_reviews r ON r.code=o.code'+where+' ORDER BY (o.status="blocked") DESC,o.updated DESC LIMIT 100',args)
+   counts=dict(c.execute('SELECT o.status,COUNT(*) FROM member_autopay_orders o LEFT JOIN member_order_scopes scope ON scope.code=o.code'+where+' GROUP BY status',args).fetchall())
    store=c.execute('SELECT name FROM stores WHERE id=?',(config['store_id'],)).fetchone() if config else None
   return {'enabled':bool(config and config['enabled']),'started':config['started'] if config else '', 'source_name':config['source_name'] if config else '会员','store_name':store[0] if store else '', 'last_scan':config['last_scan'] if config else '', 'error':config['error'] if config else '', 'orders':orders,'counts':counts,'interval':30,'discovery_end':self.windows(config)[-1][1] if config else ''}
  def control(self,action,user):

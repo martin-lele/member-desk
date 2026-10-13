@@ -18,6 +18,7 @@ def amount_in_fen(value):
  except (InvalidOperation,ValueError,TypeError):return None
 
 def assess_order(stays,source_id=None):
+ if type(source_id) is not int or source_id<=0:return {'eligible':False,'reason':'请先配置本酒店的会员来源编号'}
  # Caller must first retrieve every stay for one reservation_code.
  if not stays or any(not isinstance(r,dict) for r in stays):return {'eligible':False,'reason':'订单资料为空或格式无效'}
  codes={r.get('reservation_code') for r in stays}

@@ -11,6 +11,9 @@ METHOD=int(os.environ.get('HOSTEX_BALANCE_METHOD_ID','0'))
 ROOM_ITEM=int(os.environ.get('HOSTEX_ROOM_ITEM_ID','0'))
 POLICY=f'explicit_payment_method_{METHOD}'
 SCHEMA='''
+CREATE TABLE IF NOT EXISTS member_order_scopes(code TEXT PRIMARY KEY REFERENCES member_autopay_orders(code) ON DELETE CASCADE,store_id TEXT REFERENCES stores(id));
+CREATE TABLE IF NOT EXISTS member_order_reviews(code TEXT PRIMARY KEY REFERENCES member_autopay_orders(code) ON DELETE CASCADE,note TEXT NOT NULL,reviewer TEXT NOT NULL,updated TEXT NOT NULL);
+
 CREATE TABLE IF NOT EXISTS member_payment_evidence(
  code TEXT NOT NULL REFERENCES member_autopay_orders(code), revision INTEGER NOT NULL,
  snapshot TEXT NOT NULL, created TEXT NOT NULL, PRIMARY KEY(code,revision));
@@ -64,6 +67,7 @@ class Engine(Base):
   a=self.app
   if action=='pause':return super().control(action,user)
   if action!='enable':raise hostex.Error('不支持的操作')
+  if METHOD<=0 or ROOM_ITEM<=0:raise hostex.Error('请先配置本酒店的储值付款方式与房费项目编号')
   with a.PMS.locked():
    config=self.config()
    if not config:raise hostex.Error('请先完成本机首次支付映射配置')
@@ -74,7 +78,7 @@ class Engine(Base):
    methods=self.client_factory(token).get('income_methods').get('income_methods',[])
    if not any(m.get('id')==METHOD and m.get('name')=='储值消费' for m in methods):raise hostex.Error('百居易储值消费方式未找到或已改名，请核对')
    with a.transaction() as c:
-    c.execute('UPDATE member_autopay_config SET enabled=1,error="" WHERE id=1');a.audit(c,user,'member_payment_sync.enable','按已收房费、已配置的储值消费方式 及会员手机号同步')
+    c.execute('UPDATE member_autopay_config SET enabled=1,error="" WHERE id=1');a.audit(c,user,'member_payment_sync.enable','按已收房费、已配置的储值消费方式及会员手机号同步')
   return self.status(user)
  def date_windows(self,started):
   begin=dt.datetime.fromtimestamp(timestamp(started),self.app.CST).date()-dt.timedelta(days=1)
@@ -132,6 +136,7 @@ class Engine(Base):
    with a.PMS.locked():
     config=self.config()
     if not config or not config['enabled']:return
+    if METHOD<=0 or ROOM_ITEM<=0:raise hostex.Error('请先配置本酒店的储值付款方式与房费项目编号')
     with contextlib.closing(a.connect()) as c:policy=c.execute("SELECT value FROM metadata WHERE key='member_payment_policy'").fetchone()
     if not policy or policy[0]!=POLICY:raise hostex.Error('支付规则尚未确认，自动记账暂停')
     token=a.PMS.read().get('token','')
@@ -153,8 +158,11 @@ class Engine(Base):
       second=client.order(code)
       r2=[] if second and all(r.get('status')=='cancelled' for r in second) else self.receipts(client,code,second,config)
       if signature(first)!=signature(second) or receipt_signature(r1)!=receipt_signature(r2):raise hostex.Error('订单或收款正在变化，待保存稳定后重试')
+      try:detected_store=self.store_for(client,second)
+      except hostex.Error:detected_store=None
+      with a.transaction() as c:c.execute('INSERT INTO member_order_scopes(code,store_id) VALUES(?,?) ON CONFLICT(code) DO UPDATE SET store_id=excluded.store_id',(code,detected_store))
       result=assess_payment(second,r2,code,config['started']);target=result.get('target')
-      if not result.get('historical') and target:result['store_id']=self.store_for(client,second)
+      if not result.get('historical') and target:result['store_id']=detected_store or self.store_for(client,second)
       self.apply(code,result,config)
      except hostex.Error as e:self.block(code,str(e),target)
      if time.monotonic()>deadline:break

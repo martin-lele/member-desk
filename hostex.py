@@ -25,7 +25,7 @@ class Service:
   finally:
    if os.path.exists(name):os.unlink(name)
  def status(self):
-  c=self.read();return {'configured':bool(c.get('token')),'member_connected':False,'mode':'members_only','message':'只读授权已保存；下方可启用会员来源订单自动扣款' if c.get('token') else '尚未保存只读授权'}
+  c=self.read();return {'configured':bool(c.get('token')),'member_connected':False,'mode':'members_only','message':'只读授权已保存；自动同步还需完成本账号的支付与门店映射' if c.get('token') else '尚未保存只读授权'}
  def execute(self,action,b,local,stores):
   if action not in ('configure','disconnect'):raise Error('该功能已移除，目前仅保留会员对接授权配置')
   if not local:raise Error('授权配置只能在这台主机的本机入口操作')
